@@ -4,7 +4,7 @@ import numpy as np
 import random
 from collections import namedtuple, deque
 
-from tensorflow.keras import layers, models, optimizers, initializers
+from tensorflow.keras import layers, models, optimizers, initializers, regularizers
 import tensorflow.keras.backend as K
 import tensorflow as tf
 
@@ -13,24 +13,62 @@ import tensorflow as tf
 class KAgent:
   """
   implementation of continuous state env agent based on
-  Deterministic Deep Policy Gradient (DDPG) and TD3
+  Deterministic Deep Policy Gradient (DDPG) and Twin Delayed DDPG (TD3)
   
   https://arxiv.org/pdf/1802.09477.pdf
   https://arxiv.org/pdf/1509.02971.pdf
   
   """
-  def __init__(self, state_size, action_size, BUFFER_SIZE=int(1e6), BATCH_SIZE=128,
-               env=None, random_seed=1234, GAMMA=0.99, TAU=5e-3, TD3=True, 
+  def __init__(self, state_size, action_size, BUFFER_SIZE=int(1e6), 
+               BATCH_SIZE=128, RANDOM_WARM_UP=512,
+               env=None, random_seed=1234, GAMMA=0.99, TAU=5e-3, 
+               TD3=True, 
                policy_update_freq=2, noise_clip=0.5, 
                policy_noise=0.2, explor_noise=0.1,
-               name='agent'):
+               
+               name='agent',
+               
+               actor_layer_noise=0,
+               actor_batch_norm=False,
+               actor_activation='relu',
+               actor_layer_reg=1e-3,
+               actor_lr=1e-4,
+               actor_clip_norm=None,
+               
+               critic_layer_noise=0.1,
+               critic_batch_norm=True,
+               critic_activation='leaky',
+               critic_layer_reg=1e-3,
+               critic_lr=1e-3,
+               critic_clip_norm=1,
+               ):
+    self.TD3 = TD3
+    self.env = env
+
+    self.RANDOM_WARM_UP = RANDOM_WARM_UP
     self.BUFFER_SIZE = BUFFER_SIZE
     self.BATCH_SIZE = BATCH_SIZE
     self.GAMMA = GAMMA
     self.TAU = TAU
     self.name = name
     self.state_size = state_size
+
+    self.actor_layer_noise = actor_layer_noise
+    self.actor_layer_reg = actor_layer_reg
+    self.actor_batch_norm = actor_batch_norm
+    self.actor_activation = actor_activation
+    self.actor_lr = actor_lr
+    self.actor_clip_norm = actor_clip_norm
+
+    self.critic_layer_reg = critic_layer_reg
+    self.critic_layer_noise = critic_layer_noise
+    self.critic_batch_norm = critic_batch_norm
+    self.critic_activation = critic_activation
+    self.critic_lr = critic_lr
+    self.critic_clip_norm = critic_clip_norm
+
     self.action_size = action_size
+
     self.actor_online = self._define_actor_model(state_size, action_size)
     self.actor_target = self._define_actor_model(state_size, action_size)
     _co, _cof = self._define_critic_model(state_size, action_size, 
@@ -49,8 +87,13 @@ class KAgent:
     self.critic_target_2, _ = self._define_critic_model(state_size, action_size, 
                                                         output_size=1, 
                                                         compile_model=False)
-    self.TD3 = TD3
-    self.env = env
+    ###
+    ### init models
+    ###
+    self.soft_copy_actor(tau=1)
+    self.soft_copy_critics(tau=1)
+    ###
+
     
     if self.TD3:
       self.policy_update_freq = policy_update_freq
@@ -58,7 +101,7 @@ class KAgent:
       self.noise_clip = noise_clip
       self.explor_noise = explor_noise
       
-    self._define_actor_trainer()
+    self.actor_trainer = self._define_actor_train_func1()
     
     self.max_action = 1 if self.env is None else self.env.action_space.high.max()
     self.min_action = -1 if self.env is None else self.env.action_space.low.min()
@@ -71,8 +114,17 @@ class KAgent:
                                BATCH_SIZE, random_seed)
     self.critic_losses = []
     self.actor_losses = []
-    self.updates = 0
+
+    self.train_iters = 0
     self.actor_updates = 0
+    self.step_counter = 0
+    self.steps_to_train_counter = 0
+    self.skip_update_timer = 0
+
+    print("Actor DAG:")
+    self.actor_online.summary()
+    print("Critic DAG:")
+    self.critic_online_1.summary()
     print("Agent '{}' initialized with following params:\n {}".format(
         self.name, self.get_str()))
     return
@@ -94,17 +146,40 @@ class KAgent:
   def reset(self):
     self.noise.reset()
 
+    
+  def is_warming_up(self):
+    return len(self.memory) < self.RANDOM_WARM_UP
+    
 
-  def step(self, state, action, reward, next_state, done):
-    """Save experience in replay memory, and use random sample from buffer to learn."""
+  def step(self, state, action, reward, next_state, done, 
+           train_every_steps):
+    """Save experience in replay memory. train if required"""
     # Save experience / reward
+    self.step_counter += 1
     self.memory.add(state, action, reward, next_state, done)
 
-    # Learn, if enough samples are available in memory
-    if len(self.memory) > self.BATCH_SIZE:
-      experiences = self.memory.sample()
-      self.train(experiences, self.GAMMA)
+    if self.steps_to_train_counter > 0:
+      self.train(nr_iters=1)
+      self.steps_to_train_counter -= 1
+      self.skip_update_timer = 0
+    else:
+      self.skip_update_timer += 1
+        
+    if self.skip_update_timer >= train_every_steps:
+      self.steps_to_train_counter = train_every_steps
+      self.skip_update_timer = 0
+            
+    return
 
+  
+  def train(self, nr_iters):
+    """ use random sample from buffer to learn """
+    # Learn, if enough samples are available in memory
+    if len(self.memory) > self.RANDOM_WARM_UP:
+      for _ in range(nr_iters):
+        experiences = self.memory.sample()
+        self._train(experiences, self.GAMMA)
+  
 
   def act(self, state, add_noise=False):
     """Returns actions for given state as per current policy."""
@@ -112,6 +187,8 @@ class KAgent:
       state = state.reshape((1,-1))
     action = self.actor_online.predict(state)
     if add_noise:
+      # we are obviously in training so now check if the "act" was called before warmpup
+      assert not self.is_warming_up()
       if self.TD3:
         noise = np.random.normal(loc=0, scale=self.explor_noise, 
                                  size=action.shape)
@@ -121,7 +198,7 @@ class KAgent:
     return np.clip(action, self.min_action, self.max_action)
 
 
-  def train(self, experiences, gamma):
+  def _train(self, experiences, gamma):
     """Update policy and value parameters using given batch of experience tuples.
     Q_targets = r + γ * critic_target(next_state, actor_target(next_state))
     where:
@@ -130,10 +207,10 @@ class KAgent:
 
     Params
     ======
-        experiences (Tuple[torch.Tensor]): tuple of (s, a, r, s', done) tuples 
+        experiences: tuple of (s, a, r, s', done) tuples 
         gamma (float): discount factor
     """
-    self.updates += 1 # increment update
+    self.train_iters += 1 # increment update
     
     states, actions, rewards, next_states, dones = experiences
 
@@ -171,36 +248,68 @@ class KAgent:
       
     self.critic_losses.append(critic_loss)
     
-    if self.TD3 and (self.updates % self.policy_update_freq) != 0:
+    if self.TD3 and (self.train_iters % self.policy_update_freq) != 0:
       # not yet update so skip the policy update and the targets update
       return
     
     # ---------------------------- update actor ---------------------------- #
     self.actor_updates += 1
     # now update actor after critic update
-    actor_trainer_loss = self.actor_trainer.train_on_batch(x=states,y=None)
-    self.actor_losses.append(actor_trainer_loss)
+    actor_loss = self.actor_trainer([states])
+    actor_loss = actor_loss[0] if isinstance(actor_loss, list) else actor_loss
+    self.actor_losses.append(actor_loss)
 
     # ----------------------- update target networks ----------------------- #
-    self.soft_update(target=self.critic_target_1, source=self.critic_online_1, tau=self.TAU)
-    self.soft_update(target=self.critic_target_2, source=self.critic_online_2, tau=self.TAU)
     self.soft_update(target=self.actor_target,  source=self.actor_online,  tau=self.TAU)                     
+    self.soft_update(target=self.critic_target_1, source=self.critic_online_1, tau=self.TAU)
+    if self.TD3:
+      self.soft_update(target=self.critic_target_2, source=self.critic_online_2, tau=self.TAU)
     return
 
 
-  def save_actor(self):
-    fn = '{}_upd_{}_{}.policy'.format(self.name, self.updates, self.actor_updates)
+  def save_actor(self, label):
+    fn = '{}_{}.policy'.format(
+        self.name, label)
+    print("\n  Saving  '{}'".format(fn), flush=True)
     self.actor_online.save(fn)
+    return fn
 
 
   def load_actor(self, fn):
+    print("\nLoading actor '{}'".format(fn))
     self.actor_online = tf.keras.models.load_model(fn)
+    return
 
+  ### ToDo:
+  ### - add weight decay 1e-2
+  ### - add grad clip in optimizer norm=1
+  ###
+  ###
+  ### - run train multiple times @ each iteration ???
   ###
   ###
   ###
   
-  def _define_actor_trainer(self, lr=1e-4):
+  def _define_actor_train_func1(self, lr=1e-4):
+    """
+    alternative #1 of actor training 
+    """
+    opt = optimizers.Adam(lr=lr)
+    tf_input = layers.Input((self.state_size,), name='actor_trainer_input')
+    tf_act = self.actor_online(tf_input)
+    tf_Q = self.critic_online_1([tf_input, tf_act])
+    tf_loss = -K.mean(tf_Q)
+    tf_updates = opt.get_updates(loss=tf_loss, 
+                                 params=self.actor_online.trainable_variables)
+    train_func = K.function(inputs=[tf_input], 
+                            outputs=[tf_loss], 
+                            updates=tf_updates)
+    return train_func
+  
+  def _define_actor_trainer(self):
+    """
+    alternative #2 of actor training 
+    """
     tf_input = layers.Input((self.state_size,), name='actor_trainer_input')
     tf_actions_pred = self.actor_online(tf_input)
     # next line forces dQ / da so we can then propagate this grad in online actor
@@ -208,9 +317,15 @@ class KAgent:
     def actor_loss(y_true, y_pred):
       tf_loss = -K.mean(y_pred)
       return tf_loss
-    opt = optimizers.Adam(lr=lr)
-    self.actor_trainer = models.Model(inputs=tf_input, outputs=tf_critic_values)
-    self.actor_trainer.compile(loss=actor_loss, optimizer=opt)
+    if self.actor_clip_norm:
+      opt = optimizers.Adam(lr=self.actor_lr, 
+                            clipnorm=self.actor_clip_norm)
+    else:
+      opt = optimizers.Adam(lr=self.actor_lr)
+    self.actor_trainer_model = models.Model(inputs=tf_input, outputs=tf_critic_values)
+    self.actor_trainer_model.compile(loss=actor_loss, optimizer=opt)
+    trainer_func = lambda x: self.actor_trainer_model.train_on_batch(x=x[0],y=None)
+    return trainer_func
     
     
   
@@ -219,33 +334,99 @@ class KAgent:
       input_size = (input_size,)
     tf_input = layers.Input(input_size, name='actor_input')
     tf_x = tf_input
-    tf_x = layers.Dense(128, activation='relu',name='actor_dense_relu1')(tf_x)
-    tf_x = layers.Dense(64, activation='relu',name='actor_dense_relu2')(tf_x)
-    tf_x = layers.Dense(output_size, activation='tanh',name='actor_lin_tanh_out',
-                        kernel_initializer=initializers.RandomUniform(-3e-3,3e-3))(tf_x)
+
+    tf_x = self._fc_layer(tf_x=tf_x, output=64, 
+                          activation=self.actor_activation,
+                          bn=self.actor_batch_norm,
+                          reg=self.actor_layer_reg,
+                          noise=self.actor_layer_noise,
+                          init_uniform=False,
+                          name='a_main_1')
+    
+    tf_x = self._fc_layer(tf_x=tf_x, output=32,  # next matrix is 300x1 and rand_unif_init 3e-3
+                          activation=self.actor_activation,
+                          bn=self.actor_batch_norm,
+                          reg=self.actor_layer_reg,
+                          noise=self.actor_layer_noise,
+                          init_uniform=False,
+                          name='a_main_2')
+    
+    tf_x = self._fc_layer(tf_x=tf_x, output=output_size, 
+                          activation='tanh',
+                          bn=False,
+                          reg=self.actor_layer_reg,
+                          noise=False,
+                          init_uniform=True,
+                          name='a_output')
+    
     model = models.Model(inputs=tf_input, outputs=tf_x, name='actor')
     return model
+  
+  def _fc_layer(self, tf_x, output, activation, bn, reg, noise, name, init_uniform):    
+    assert activation in ['linear', 'leaky', 'relu', 'tanh']
+    ker_reg = regularizers.l2(reg) if reg > 0 else None
+    ker_init = initializers.RandomUniform(-3e-3,3e-3) if init_uniform else 'glorot_uniform'
+    tf_x = layers.Dense(output, name=name+"_dns", 
+                        kernel_regularizer=ker_reg,
+                        kernel_initializer=ker_init)(tf_x)
+    if activation != 'linear':
+      if bn:
+        tf_x = layers.BatchNormalization(name=name+"_bn")(tf_x)
+      if activation == 'leaky':
+        tf_x = layers.LeakyReLU(name=name+"_Lrel")(tf_x)
+      else:
+        tf_x = layers.Activation(activation, name=name+"_"+activation)(tf_x)
+      if noise>0:
+        tf_x = layers.GaussianNoise(stddev=noise, name=name+"_gnoise")(tf_x)
+    return tf_x
+    
     
   def _define_critic_model(self, input_size, action_size, output_size, 
-                           act=None, compile_model=True, lr=1e-3):
+                           output_activation=None, compile_model=True):
     if not isinstance(input_size,tuple):
       input_size = (input_size,)
     if not isinstance(action_size, tuple):
       action_size = (action_size,)
-    tf_input_state = layers.Input(input_size, name='critic_input_state')
-    tf_input_action = layers.Input(action_size, name='critic_input_action')
-    tf_x = tf_input_state
-    tf_x = layers.Dense(128, activation='relu',name='critic_dense_relu1')(tf_x)
-    tf_x = layers.concatenate([tf_x, tf_input_action], name='critic_concat_action_state')
-    tf_x = layers.Dense(128, activation='relu',name='critic_dense_relu2')(tf_x)
-    tf_x = layers.Dense(64, activation='relu',name='critic_dense_relu3')(tf_x)
-    tf_x = layers.Dense(output_size, activation=act, name='critic_dense_out',
-                        kernel_initializer=initializers.RandomUniform(-3e-3,3e-3))(tf_x)
+    tf_input_state = layers.Input(input_size, name='c_input_state')
+    tf_input_action = layers.Input(action_size, name='c_input_action')
+    tf_x_s = tf_input_state
+        
+    tf_x_s = self._fc_layer(tf_x=tf_x_s, output=64, 
+                            activation=self.critic_activation,
+                            bn=self.critic_batch_norm,
+                            reg=self.critic_layer_reg,
+                            noise=self.critic_layer_noise,
+                            init_uniform=False,
+                            name='c_state')
+    tf_x_a = tf_input_action
+    
+    tf_x = layers.concatenate([tf_x_s, tf_x_a], name='c_concat_sa')
+    
+    tf_x = self._fc_layer(tf_x=tf_x, output=32, 
+                          activation=self.critic_activation,
+                          bn=self.critic_batch_norm,
+                          reg=self.critic_layer_reg,
+                          noise=self.critic_layer_noise,
+                          init_uniform=False,
+                          name='c_main')
+
+    tf_x = self._fc_layer(tf_x=tf_x, output=1, 
+                          activation='linear',
+                          bn=self.critic_batch_norm,
+                          reg=self.critic_layer_reg,
+                          noise=self.critic_layer_noise,
+                          init_uniform=True,
+                          name='c_output')
+    
     model = models.Model(inputs=[tf_input_state,tf_input_action], outputs=tf_x,
                          name='critic')
     
     if compile_model:
-      opt = optimizers.Adam(lr=lr)    
+      if self.critic_clip_norm:
+        opt = optimizers.Adam(lr=self.critic_lr, 
+                              clipnorm=self.critic_clip_norm)    
+      else:
+        opt = optimizers.Adam(lr=self.critic_lr, )
       model.compile(loss='mse', optimizer=opt)
     
     model_frozen = models.Model(inputs=[tf_input_state,tf_input_action], outputs=tf_x,
@@ -261,10 +442,12 @@ class KAgent:
     return
   
   def soft_copy_actor(self, tau=0.005):
-    self.soft_copy(self.actor_target, self.actor_online, tau=tau)
+    self.soft_update(self.actor_target, self.actor_online, tau=tau)
     
-  def soft_copy_critic(self, tau=0.005):
-    self.soft_copy(self.critic_target, self.critic_online, tau=tau)
+  def soft_copy_critics(self, tau=0.005):
+    self.soft_update(self.critic_target_1, self.critic_online_1, tau=tau)
+    if self.TD3:
+      self.soft_update(self.critic_target_2, self.critic_online_2, tau=tau)
 
 
 
@@ -333,15 +516,33 @@ class ReplayBuffer:
   
 if __name__ == '__main__':
   
-  act = KAgent(state_size=24, action_size=4)
-  print("Mean of online weights {}".format([x.mean() for x in act.actor_online.get_weights()]))
-  print("Mean of target weights {}".format([x.mean() for x in act.actor_target.get_weights()]))
-  modw = [x * 1e-5 for x in act.actor_target.get_weights()]
+  act = KAgent(state_size=24, action_size=4,)
+  
+  m1 = act.actor_online
+  m2 = act.actor_target
+  print("Actor:")
+  print("Mean of online weights {}".format([x.mean() for x in m1.get_weights()]))
+  print("Mean of target weights {}".format([x.mean() for x in m2.get_weights()]))
+  modw = [x * 2 for x in m2.get_weights()]
   print("Modifying target weights")
-  act.actor_target.set_weights(modw)
-  print("Mean of target weights {}".format([x.mean() for x in act.actor_target.get_weights()]))
+  m2.set_weights(modw)
+  print("Mean of target weights {}".format([x.mean() for x in m2.get_weights()]))
   tau = 0.5
   print("Soft update target with tau={}".format(tau))
   act.soft_copy_actor(tau=tau)
-  print("Mean of target weights {}".format([x.mean() for x in act.actor_target.get_weights()]))
+  print("Mean of target weights {}".format([x.mean() for x in m2.get_weights()]))
   
+  print("Critic:")
+  m1 = act.critic_online_1
+  m2 = act.critic_target_1
+  print("Mean of online weights {}".format([x.mean() for x in m1.get_weights()]))
+  print("Mean of target weights {}".format([x.mean() for x in m2.get_weights()]))
+  modw = [x * 2 for x in m2.get_weights()]
+  print("Modifying target weights")
+  m2.set_weights(modw)
+  print("Mean of target weights {}".format([x.mean() for x in m2.get_weights()]))
+  tau = 0.5
+  print("Soft update target with tau={}".format(tau))
+  act.soft_copy_critics(tau=tau)
+  print("Mean of target weights {}".format([x.mean() for x in m2.get_weights()]))
+    
