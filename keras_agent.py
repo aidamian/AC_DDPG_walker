@@ -9,6 +9,26 @@ import tensorflow.keras.backend as K
 import tensorflow as tf
 
 
+def custom_kernel_init(shape, dtype=None, partition_info=None):
+  fan_in = shape[0]
+  val = 1. / np.sqrt(fan_in)
+  return K.random_uniform(shape=shape, minval=-val, maxval=val, dtype=dtype)
+
+class CustomKernelInit:
+  def __call__(self, shape, dtype=None, partition_info=None):
+    return custom_kernel_init(shape=shape, dtype=dtype)
+
+
+def reset_seeds(seed=123):
+  """
+  radom seeds reset for reproducible results
+  """
+  print("Resetting all seeds...", flush=True)
+  random.seed(seed)
+  np.random.seed(seed)
+  tf.set_random_seed(seed) 
+  return
+
 
 class KAgent:
   """
@@ -20,7 +40,7 @@ class KAgent:
   
   """
   def __init__(self, state_size, action_size, BUFFER_SIZE=int(1e6), 
-               BATCH_SIZE=128, RANDOM_WARM_UP=512,
+               BATCH_SIZE=512, RANDOM_WARM_UP=1024,
                env=None, random_seed=1234, GAMMA=0.99, TAU=5e-3, 
                TD3=True, 
                policy_update_freq=2, noise_clip=0.5, 
@@ -34,16 +54,23 @@ class KAgent:
                actor_layer_reg=1e-3,
                actor_lr=1e-4,
                actor_clip_norm=None,
+               actor_custom_init=True,
                
-               critic_layer_noise=0.1,
+               critic_layer_noise=0,
                critic_batch_norm=True,
+               critic_state_batch_norm=True,
                critic_activation='leaky',
                critic_layer_reg=1e-3,
-               critic_lr=1e-3,
+               critic_lr=1e-4,
                critic_clip_norm=1,
+               critic_custom_init=True,
+               critic_simple=True,
                ):
+    print("Start init Agent...", flush=True)
     self.TD3 = TD3
     self.env = env
+    
+    
 
     self.RANDOM_WARM_UP = RANDOM_WARM_UP
     self.BUFFER_SIZE = BUFFER_SIZE
@@ -51,6 +78,11 @@ class KAgent:
     self.GAMMA = GAMMA
     self.TAU = TAU
     self.name = name
+    
+
+    self.MIN_EXPL_NOISE = 0.03
+    self.MIN_POLI_NOISE = 0.05    
+
     self.state_size = state_size
 
     self.actor_layer_noise = actor_layer_noise
@@ -59,38 +91,50 @@ class KAgent:
     self.actor_activation = actor_activation
     self.actor_lr = actor_lr
     self.actor_clip_norm = actor_clip_norm
+    self.actor_custom_init = 'custom' if actor_custom_init else 'glorot_uniform'
 
     self.critic_layer_reg = critic_layer_reg
     self.critic_layer_noise = critic_layer_noise
     self.critic_batch_norm = critic_batch_norm
+    self.critic_state_batch_norm = critic_state_batch_norm
     self.critic_activation = critic_activation
     self.critic_lr = critic_lr
     self.critic_clip_norm = critic_clip_norm
+    self.critic_custom_init = 'custom' if critic_custom_init else 'glorot_uniform'
+    self.critic_simple = critic_simple
 
     self.action_size = action_size
 
+    print("actor_online...", flush=True)
     self.actor_online = self._define_actor_model(state_size, action_size)
+    print("actor_target...", flush=True)
     self.actor_target = self._define_actor_model(state_size, action_size)
+    print("critic_online_1...", flush=True)
     _co, _cof = self._define_critic_model(state_size, action_size, 
                                           output_size=1, 
                                           compile_model=True)
     self.critic_online_1 = _co
     self.critic_online_frozen = _cof
+    print("critic_target_1...", flush=True)
     self.critic_target_1, _ = self._define_critic_model(state_size, action_size, 
                                                         output_size=1, 
                                                         compile_model=False)
     
     
+    print("critic_online_2...", flush=True)
     self.critic_online_2, _ = self._define_critic_model(state_size, action_size, 
                                                         output_size=1, 
                                                         compile_model=True)
+    print("critic_target_2...", flush=True)
     self.critic_target_2, _ = self._define_critic_model(state_size, action_size, 
                                                         output_size=1, 
                                                         compile_model=False)
     ###
     ### init models
     ###
+    print("soft_copy_actor...", flush=True)
     self.soft_copy_actor(tau=1)
+    print("soft_copy_critics...", flush=True)
     self.soft_copy_critics(tau=1)
     ###
 
@@ -121,27 +165,58 @@ class KAgent:
     self.steps_to_train_counter = 0
     self.skip_update_timer = 0
 
+    print("Done init Agent.", flush=True)
+
     print("Actor DAG:")
     self.actor_online.summary()
     print("Critic DAG:")
     self.critic_online_1.summary()
-    print("Agent '{}' initialized with following params:\n {}".format(
-        self.name, self.get_str()))
+    print("Agent '{}' initialized with following params:\n{}".format(
+        self.name, self.get_info_str()))
     return
 
 
-  def get_str(self):
+  def get_info_str(self):
     obj = self
-    out_str = obj.__class__.__name__+"("
+    out_str = ""
     for prop, value in vars(obj).items():
       if type(value) in [int, float, bool]:
-        out_str += prop+'='+str(value) + ','
+        out_str += "  " + prop + '=' + str(value) + '\n'
       elif type(value) in [str]:
-        out_str += prop+"='" + value + "',"
-    out_str = out_str[:-1] if out_str[-1]==',' else out_str
-    out_str += ')'
+        out_str += "  " + prop + "='" + value + "'\n"
     return out_str
   
+  
+  def reduce_explore_noise(self, down_scale=0.9):
+    self.explor_noise = max(self.MIN_EXPL_NOISE, self.explor_noise * down_scale)
+    print("\nNew explor noise: {:.4f}".format(self.explor_noise))
+    return
+  
+  
+  def reduce_policy_noise(self, down_scale=0.9):
+    self.policy_noise = max(self.MIN_POLI_NOISE, self.policy_noise * down_scale)
+    print("\nNew policy noise: {:.4f}".format(self.policy_noise))
+    return
+    
+      
+  def reduce_noise(self, down_scale):
+    self.reduce_explore_noise(down_scale)
+    self.reduce_policy_noise(down_scale)
+    return
+  
+  
+  def clear_policy_noise(self):
+    if self.policy_noise != 0:
+      self.policy_noise = 0
+      print("\nPolicy noise stopped!")
+    return
+  
+  def clear_explore_noise(self):
+    if self.exploration_noise != 0:
+      self.exploration_noise = 0
+      print("\nExploration noise stopped")
+    return  
+
   
   def reset(self):
     self.noise.reset()
@@ -152,7 +227,7 @@ class KAgent:
     
 
   def step(self, state, action, reward, next_state, done, 
-           train_every_steps):
+           train_every_steps, train_steps=0):
     """Save experience in replay memory. train if required"""
     # Save experience / reward
     self.step_counter += 1
@@ -166,7 +241,9 @@ class KAgent:
       self.skip_update_timer += 1
         
     if self.skip_update_timer >= train_every_steps:
-      self.steps_to_train_counter = train_every_steps
+      if train_steps == 0:
+        train_steps = train_every_steps
+      self.steps_to_train_counter = train_steps
       self.skip_update_timer = 0
             
     return
@@ -255,7 +332,8 @@ class KAgent:
     # ---------------------------- update actor ---------------------------- #
     self.actor_updates += 1
     # now update actor after critic update
-    actor_loss = self.actor_trainer([states])
+    _learning_phase = 1
+    actor_loss = self.actor_trainer([states, _learning_phase])
     actor_loss = actor_loss[0] if isinstance(actor_loss, list) else actor_loss
     self.actor_losses.append(actor_loss)
 
@@ -277,7 +355,10 @@ class KAgent:
 
   def load_actor(self, fn):
     print("\nLoading actor '{}'".format(fn))
-    self.actor_online = tf.keras.models.load_model(fn)
+    
+    self.actor_online = tf.keras.models.load_model(fn,
+                          custom_objects={
+                           'custom_kernel_init': CustomKernelInit})
     return
 
   ### ToDo:
@@ -290,23 +371,29 @@ class KAgent:
   ###
   ###
   
-  def _define_actor_train_func1(self, lr=1e-4):
+  def _define_actor_train_func1(self):
     """
     alternative #1 of actor training 
     """
-    opt = optimizers.Adam(lr=lr)
+    if self.actor_clip_norm:
+      opt = optimizers.Adam(lr=self.actor_lr, 
+                            clipnorm=self.actor_clip_norm)
+    else:
+      opt = optimizers.Adam(lr=self.actor_lr)
+
     tf_input = layers.Input((self.state_size,), name='actor_trainer_input')
     tf_act = self.actor_online(tf_input)
     tf_Q = self.critic_online_1([tf_input, tf_act])
     tf_loss = -K.mean(tf_Q)
     tf_updates = opt.get_updates(loss=tf_loss, 
                                  params=self.actor_online.trainable_variables)
-    train_func = K.function(inputs=[tf_input], 
+    # now we must pass K.learning_phase() tensor otherwise we'll have no dropout/BN
+    train_func = K.function(inputs=[tf_input, K.learning_phase())], 
                             outputs=[tf_loss], 
                             updates=tf_updates)
     return train_func
   
-  def _define_actor_trainer(self):
+  def _define_actor_train_func2(self):
     """
     alternative #2 of actor training 
     """
@@ -330,25 +417,39 @@ class KAgent:
     
   
   def _define_actor_model(self, input_size, output_size):
+    """
+    1509.02971:
+      'In the low-dimensional case, we used batch normalization on the state 
+      input and all layers of the µ network and all layers of the Q network prior
+      to the action input'
+      
+    """
     if not isinstance(input_size,tuple):
       input_size = (input_size,)
     tf_input = layers.Input(input_size, name='actor_input')
     tf_x = tf_input
-
-    tf_x = self._fc_layer(tf_x=tf_x, output=64, 
+    
+    if self.actor_batch_norm:
+      tf_x = layers.BatchNormalization(name="a_state_bn")(tf_x)
+      use_next_bias=False
+    else:
+      use_next_bias=True
+    
+    tf_x = self._fc_layer(tf_x=tf_x, output=400, 
                           activation=self.actor_activation,
                           bn=self.actor_batch_norm,
                           reg=self.actor_layer_reg,
                           noise=self.actor_layer_noise,
-                          init_uniform=False,
+                          init_func=self.actor_custom_init,
+                          use_bias=use_next_bias,
                           name='a_main_1')
     
-    tf_x = self._fc_layer(tf_x=tf_x, output=32,  # next matrix is 300x1 and rand_unif_init 3e-3
+    tf_x = self._fc_layer(tf_x=tf_x, output=300,  # next matrix is 300x1 and rand_unif_init 3e-3
                           activation=self.actor_activation,
                           bn=self.actor_batch_norm,
                           reg=self.actor_layer_reg,
                           noise=self.actor_layer_noise,
-                          init_uniform=False,
+                          init_func=self.actor_custom_init,
                           name='a_main_2')
     
     tf_x = self._fc_layer(tf_x=tf_x, output=output_size, 
@@ -356,24 +457,42 @@ class KAgent:
                           bn=False,
                           reg=self.actor_layer_reg,
                           noise=False,
-                          init_uniform=True,
+                          init_func='end',
                           name='a_output')
     
     model = models.Model(inputs=tf_input, outputs=tf_x, name='actor')
     return model
   
-  def _fc_layer(self, tf_x, output, activation, bn, reg, noise, name, init_uniform):    
+  def _fc_layer(self, tf_x, output, activation, bn, reg, noise, init_func,                
+                name, 
+                use_bias=True):    
     assert activation in ['linear', 'leaky', 'relu', 'tanh']
+    
     ker_reg = regularizers.l2(reg) if reg > 0 else None
-    ker_init = initializers.RandomUniform(-3e-3,3e-3) if init_uniform else 'glorot_uniform'
-    tf_x = layers.Dense(output, name=name+"_dns", 
-                        kernel_regularizer=ker_reg,
-                        kernel_initializer=ker_init)(tf_x)
+    if init_func == 'end':
+      ker_init = initializers.RandomUniform(-3e-3,3e-3)
+    elif init_func == 'custom':
+      ker_init = custom_kernel_init
+    else:
+      ker_init = init_func
+    if use_bias:
+      tf_x = layers.Dense(output, name=name+"_dns", 
+                          kernel_regularizer=ker_reg,
+                          kernel_initializer=ker_init,
+                          use_bias=True,
+                          bias_initializer=ker_init)(tf_x)
+    else:
+      tf_x = layers.Dense(output, name=name+"_dns", 
+                          kernel_regularizer=ker_reg,
+                          kernel_initializer=ker_init,
+                          use_bias=False,
+                          )(tf_x)
+      
     if activation != 'linear':
       if bn:
         tf_x = layers.BatchNormalization(name=name+"_bn")(tf_x)
       if activation == 'leaky':
-        tf_x = layers.LeakyReLU(name=name+"_Lrel")(tf_x)
+        tf_x = layers.LeakyReLU(name=name+"_LeRe")(tf_x)
       else:
         tf_x = layers.Activation(activation, name=name+"_"+activation)(tf_x)
       if noise>0:
@@ -390,32 +509,44 @@ class KAgent:
     tf_input_state = layers.Input(input_size, name='c_input_state')
     tf_input_action = layers.Input(action_size, name='c_input_action')
     tf_x_s = tf_input_state
+    tf_x_a = tf_input_action
         
-    tf_x_s = self._fc_layer(tf_x=tf_x_s, output=64, 
+    if not self.critic_simple:
+      tf_x_s = self._fc_layer(tf_x=tf_x_s, output=400, 
+                              activation=self.critic_activation,
+                              bn=self.critic_state_batch_norm,
+                              reg=self.critic_layer_reg,
+                              noise=False, #self.critic_layer_noise,
+                              init_func=self.critic_custom_init,
+                              name='c_state')
+    
+    tf_x = layers.concatenate([tf_x_s, tf_x_a], name='c_concat_sa')
+    
+    if self.critic_simple:
+      tf_x = self._fc_layer(tf_x=tf_x, output=400, 
                             activation=self.critic_activation,
                             bn=self.critic_batch_norm,
                             reg=self.critic_layer_reg,
                             noise=self.critic_layer_noise,
-                            init_uniform=False,
-                            name='c_state')
-    tf_x_a = tf_input_action
+                            init_func=self.critic_custom_init,
+                            name='c_main_0')
+      
     
-    tf_x = layers.concatenate([tf_x_s, tf_x_a], name='c_concat_sa')
-    
-    tf_x = self._fc_layer(tf_x=tf_x, output=32, 
+    tf_x = self._fc_layer(tf_x=tf_x, output=300, 
                           activation=self.critic_activation,
                           bn=self.critic_batch_norm,
                           reg=self.critic_layer_reg,
                           noise=self.critic_layer_noise,
-                          init_uniform=False,
-                          name='c_main')
+                          init_func=self.critic_custom_init,
+                          name='c_main_1')
+
 
     tf_x = self._fc_layer(tf_x=tf_x, output=1, 
                           activation='linear',
-                          bn=self.critic_batch_norm,
+                          bn=False,
                           reg=self.critic_layer_reg,
-                          noise=self.critic_layer_noise,
-                          init_uniform=True,
+                          noise=False,
+                          init_func='end',
                           name='c_output')
     
     model = models.Model(inputs=[tf_input_state,tf_input_action], outputs=tf_x,
@@ -435,9 +566,12 @@ class KAgent:
     return model, model_frozen
   
   def soft_update(self, target, source, tau):
+    #print("Load target weights...")
     wt = target.get_weights()
+    #print("Load source weights...")
     ws = source.get_weights()
     wf = [wt[i] * (1 - tau) + ws[i] * tau for i in range(len(wt))]
+    #print("Setting target weights...")
     target.set_weights(wf)
     return
   
@@ -515,34 +649,39 @@ class ReplayBuffer:
     return len(self.memory)  
   
 if __name__ == '__main__':
+  print("Random seeds",flush=True)
+  np.random.seed(42)
+  random.seed(12345)
+  tf.set_random_seed(1234)
+  print("Done random seeds",flush=True)
   
   act = KAgent(state_size=24, action_size=4,)
   
   m1 = act.actor_online
   m2 = act.actor_target
   print("Actor:")
-  print("Mean of online weights {}".format([x.mean() for x in m1.get_weights()]))
-  print("Mean of target weights {}".format([x.mean() for x in m2.get_weights()]))
+  print("Mean of online weights {}".format([x.mean().round(4) for x in m1.get_weights()]))
+  print("Mean of target weights {}".format([x.mean().round(4) for x in m2.get_weights()]))
   modw = [x * 2 for x in m2.get_weights()]
   print("Modifying target weights")
   m2.set_weights(modw)
-  print("Mean of target weights {}".format([x.mean() for x in m2.get_weights()]))
+  print("Mean of target weights {}".format([x.mean().round(4) for x in m2.get_weights()]))
   tau = 0.5
   print("Soft update target with tau={}".format(tau))
   act.soft_copy_actor(tau=tau)
-  print("Mean of target weights {}".format([x.mean() for x in m2.get_weights()]))
+  print("Mean of target weights {}".format([x.mean().round(4) for x in m2.get_weights()]))
   
   print("Critic:")
   m1 = act.critic_online_1
   m2 = act.critic_target_1
-  print("Mean of online weights {}".format([x.mean() for x in m1.get_weights()]))
-  print("Mean of target weights {}".format([x.mean() for x in m2.get_weights()]))
+  print("Mean of online weights {}".format([x.mean().round(4) for x in m1.get_weights()]))
+  print("Mean of target weights {}".format([x.mean().round(4) for x in m2.get_weights()]))
   modw = [x * 2 for x in m2.get_weights()]
   print("Modifying target weights")
   m2.set_weights(modw)
-  print("Mean of target weights {}".format([x.mean() for x in m2.get_weights()]))
+  print("Mean of target weights {}".format([x.mean().round(4) for x in m2.get_weights()]))
   tau = 0.5
   print("Soft update target with tau={}".format(tau))
   act.soft_copy_critics(tau=tau)
-  print("Mean of target weights {}".format([x.mean() for x in m2.get_weights()]))
+  print("Mean of target weights {}".format([x.mean().round(4) for x in m2.get_weights()]))
     

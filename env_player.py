@@ -7,10 +7,13 @@ from datetime import datetime as dt
 
 import imageio
 
+__VER__ = '0.9.1'
+
 
 class EnvPlayer:
   def __init__(self, env=None, agent=None, save_gif='test.gif', frames_only=False):
     self.frames_only = frames_only    
+    self.__version__ = __VER__
     self.env = env
     if not self.frames_only:
       if self.env is None:
@@ -71,7 +74,7 @@ class EnvPlayer:
     if self.env:
       self.env.close()
     self.video_started = False
-    if self.save_gif:      
+    if self.save_gif:
       imageio.mimsave(self.save_gif, self.buff_frames)
       print("Animated gif saved in {}".format(self.save_gif))
     return
